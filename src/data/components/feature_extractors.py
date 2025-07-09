@@ -1,6 +1,9 @@
+import sys
+sys.path.append("/home/anvithak/quantifying-redundancy")
 import re
 import pickle
 import os
+import traceback
 from collections import defaultdict
 import numpy as np
 import scipy.stats as stats
@@ -20,6 +23,7 @@ from src.utils.text_processing import (
     python_remove_punctuation,
     python_lowercase_remove_punctuation,
     read_lab_file,
+    read_textgrid_file,
     remove_breaks_from_lab_lines,
     nb_syllables,
 )
@@ -62,10 +66,11 @@ class ProsodyFeatureExtractor:
         wav_root: str = None,
         phoneme_lab_root: str = None,
         data_cache: str = None,
+        language: str = None,
         extract_f0: bool = False,
         f0_mode: str = "dct",
         f0_n_coeffs: int = 4,
-        f0_stress_localizer: str = "celex",
+        f0_stress_localizer: str = None,
         f0_window: int = 500,  # ms
         f0_resampling_length: int = 100,
         celex_path: str = None,
@@ -78,7 +83,7 @@ class ProsodyFeatureExtractor:
         extract_pause_after: bool = False,
         extract_prominence: bool = False,
         prominence_mode: str = "mean",
-        f0_min: float = 50,
+        f0_min: float = 50, # 50/400 are actually better
         f0_max: float = 400,
         f0_voicing: float = 50,
         energy_min_freq: float = 200,
@@ -114,6 +119,7 @@ class ProsodyFeatureExtractor:
         self.wav_root = wav_root
         self.phoneme_lab_root = phoneme_lab_root
         self.data_cache = data_cache
+        self.language = language
 
         self.extract_f0 = extract_f0
         self.f0_mode = f0_mode
@@ -121,7 +127,7 @@ class ProsodyFeatureExtractor:
         self.f0_stress_localizer = f0_stress_localizer
         self.f0_window = f0_window
         self.f0_resampling_length = f0_resampling_length
-        if self.extract_f0:
+        if self.extract_f0 and self.language == 'stress':
             self.celex_path = celex_path
             self.celex_manager = CelexReader(celex_path)
         self.extract_energy = extract_energy
@@ -156,6 +162,7 @@ class ProsodyFeatureExtractor:
 
         # print what is going to be extracted
         extracted_features = []
+        d_correct = {'texts': []}
         for feature in [
             "f0",
             "energy",
@@ -167,24 +174,63 @@ class ProsodyFeatureExtractor:
         ]:
             if getattr(self, f"extract_{feature}"):
                 extracted_features.append(feature)
+                d_correct[feature] = []
+        #d_correct['f0_original'] = [] # the pitch without dct transformations
         print(f"Extracted features ----: {extracted_features}")
 
-        # process files
         self.process_files()
 
+        for sample in self.samples:
+            d_correct['texts'].append(sample['text'])
+            for feature in extracted_features:
+                if feature == 'f0':
+                    d_correct['f0'].append(sample['features']['f0_parameterized'])
+                    #d_correct['f0_original'].append(sample['features']['f0_original'])
+                else:
+                    d_correct[feature].append(sample['features'][feature])
+
+        file_name = lab_root.split("/")[-1]
+        print(lab_root)
+        print(file_name)
+        self.file_name = file_name
+        #cache_path = os.path.join(data_cache, file_name, "f0_dct_4.pkl")
+        if extracted_features[0] == 'f0':
+            cache_path = os.path.join(data_cache, file_name, f"{extracted_features[0]}_{f0_mode}_{f0_n_coeffs}.pkl")
+        else:
+            cache_path = os.path.join(data_cache, file_name, f"{extracted_features[0]}.pkl")
+        self.cache_path = cache_path
+        os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
+        pickle.dump(d_correct, open(self.cache_path, "wb"))
+        print(f"Saved samples to {self.cache_path}")
+        '''        if os.path.exists(cache_path):
+            self.samples = pickle.load(open(cache_path, "rb"))
+            print(f"Loaded {len(self.samples)} samples from cache.")
+        else:
+            print(f"No cache found. Extracting features {file_name} from scratch.")
+            # process files
+            self.process_files()'''
+            
+            
+        
     def _parameterize_f0(self, f0):
         if self.f0_mode == "dct":
-            f0_coeffs = dct(f0, type=2, norm="ortho")
+            f0_coeffs = dct(f0, type=2, norm="ortho")[: self.f0_n_coeffs]
         elif self.f0_mode == "fft":
-            f0_coeffs = fft(f0)
+            f0_coeffs = fft(f0)[: self.f0_n_coeffs]
         elif self.f0_mode == "poly":
             degree = self.f0_n_coeffs - 1  # Degree of polynomial
-            f0_coeffs = np.polyfit(np.arange(len(f0)), f0, degree)
+            f0_coeffs = np.polyfit(np.arange(len(f0)), f0, degree)[: self.f0_n_coeffs]
+        elif self.f0_mode == "mean":
+            precision = len(f0)//self.f0_n_coeffs
+            f0_coeffs = []
+            for i in range(0,len(f0),precision):
+                f0_coeffs.append(np.mean(f0[i:i+precision]))
+            f0_coeffs = np.array(f0_coeffs)
         else:
             raise ValueError("Unknown f0_mode: {}".format(self.f0_mode))
 
-        return f0_coeffs[: self.f0_n_coeffs]
-
+        return f0_coeffs
+    
     def _extract_f0(self, waveform, fs):
         f0_raw = f0_processing.extract_f0(
             waveform=waveform,
@@ -192,9 +238,13 @@ class ProsodyFeatureExtractor:
             f0_min=self.f0_min,
             f0_max=self.f0_max,
             voicing=self.f0_voicing,
+            #configuration="REAPER",
         )
+        #print('f0_raw shape: ', f0_raw.shape)
         f0_interpolated = f0_processing.process(f0_raw)
+        #print('f0_interpolated shape: ', f0_interpolated.shape)
         f0_normalized = normalize_std(f0_interpolated)
+        #print('f0_normalized shape: ', f0_normalized.shape)
         return f0_normalized
 
     def _extract_energy(self, waveform, fs):
@@ -252,8 +302,8 @@ class ProsodyFeatureExtractor:
             raise ValueError(f"Unknown word_duration_mode: {self.word_duration_mode}")
         return word_duration
 
-    def _extract_feature_per_word(self, lab_lines, feature):
-        end_time = float(lab_lines[-1][1])
+    def _extract_feature_per_word(self, lab_lines, feature, end_time):
+        #end_time = float(lab_lines[-1][1]) ## this is wrong as well?
         features = []
         for start, end, word in lab_lines:
             start_idx = sec_to_idx(float(start), end_time, len(feature))
@@ -261,15 +311,18 @@ class ProsodyFeatureExtractor:
             features.append(feature[start_idx:end_idx])
         return features
 
-    def _extract_f0_per_word(self, lab_lines, f0, phoneme_lab_lines, verbose=False):
+    def _extract_f0_per_word(self, lab_lines, f0, phoneme_lab_lines, end_time = 0, verbose=False):
         """
         Extracts f0 per word from the f0 signal.
         Here we can make choices for the stress localization
         """
         cnt_not_found = 0
-        end_time = float(lab_lines[-1][1])
+        #if self. :
+        #    end_time = float(lab_lines[-1][1]) ## this end time is wrong I think --> maybe it's only correct for lab files
         f0_per_word = []
         for start, end, word in lab_lines:
+            #print(lab_lines)
+            #print(start,end,word)
             start_idx = sec_to_idx(float(start), end_time, len(f0))
             end_idx = sec_to_idx(float(end), end_time, len(f0))
             if verbose:
@@ -314,9 +367,15 @@ class ProsodyFeatureExtractor:
                 )
 
             else:
-                raise NotImplementedError(
-                    f"Unknown f0_stress_localizer: {self.f0_stress_localizer}"
+                new_start = start_idx
+                new_end = end_idx
+                #print(f"new start idx: {new_start}, end idx: {new_end}")
+                f0_per_word.append(
+                    signal.resample(f0[new_start:new_end], self.f0_resampling_length)
                 )
+                #raise NotImplementedError(
+                #    f"Unknown f0_stress_localizer: {self.f0_stress_localizer}"
+                #)
 
         return f0_per_word, cnt_not_found
 
@@ -324,10 +383,16 @@ class ProsodyFeatureExtractor:
         features = {}
         nb_syllables_not_found = 0
 
-        if self.extract_f0 or self.extract_energy or self.extract_duration:
-            fs, waveform = read_wav(wav_path)
-        lab_lines = read_lab_file(lab_path)  # contains breaks
-        phoneme_lab_lines = read_lab_file(phoneme_lab_path)  # contains breaks
+        #if self.extract_f0 or self.extract_energy or self.extract_duration:
+        fs, waveform = read_wav(wav_path)
+        if '.TextGrid' in lab_path:
+            '''lab_lines = read_textgrid_file(lab_path,sample_rate=fs,phones_or_words='words') # contains breaks
+            phoneme_lab_lines = read_textgrid_file(phoneme_lab_path,sample_rate=fs,phones_or_words='phones') # contains breaks'''
+            lab_files, end_time = read_textgrid_file(lab_path,sample_rate=fs)
+            lab_lines, phoneme_lab_lines = lab_files['words'], lab_files['phones']
+        else:
+            lab_lines = read_lab_file(lab_path)  # contains breaks
+            phoneme_lab_lines = read_lab_file(phoneme_lab_path)  # contains breaks
         f0, energy, duration, prominence = None, None, None, None
 
         # need full lab lines for the pauses
@@ -386,15 +451,20 @@ class ProsodyFeatureExtractor:
         # Then extract the features over the words
         if self.extract_f0:
             f0_per_word, cnt_not_found = self._extract_f0_per_word(
-                lab_lines, f0, phoneme_lab_lines
+                lab_lines, f0, phoneme_lab_lines, end_time
             )
             nb_syllables_not_found += cnt_not_found
-            # print("f0 per word", f0_per_word)
-            f0_per_word_parameterized = [self._parameterize_f0(f) for f in f0_per_word]
+            #print("f0 per word[0]", f0_per_word[0])
+            if self.f0_mode == "curve":
+                print("curve")
+                f0_per_word_parameterized = [f for f in f0_per_word]
+            else:
+                f0_per_word_parameterized = [self._parameterize_f0(f) for f in f0_per_word]
             features["f0_parameterized"] = f0_per_word_parameterized
+            #features["f0_original"] = f0_per_word
 
         if self.extract_energy:
-            energy_per_word = self._extract_feature_per_word(lab_lines, energy)
+            energy_per_word = self._extract_feature_per_word(lab_lines, energy, end_time)
             if self.energy_mode == "mean":
                 energy_per_word = [np.mean(e) for e in energy_per_word]
             elif self.energy_mode == "max":
@@ -408,11 +478,11 @@ class ProsodyFeatureExtractor:
             features["energy"] = energy_per_word
 
         if self.extract_duration:
-            duration_per_word = self._extract_feature_per_word(lab_lines, duration)
+            duration_per_word = self._extract_feature_per_word(lab_lines, duration, end_time)
             features["duration"] = duration_per_word
 
         if self.extract_prominence:
-            prominence_per_word = self._extract_feature_per_word(lab_lines, prominence)
+            prominence_per_word = self._extract_feature_per_word(lab_lines, prominence, end_time)
             if self.prominence_mode == "mean":
                 prominence_per_word = [np.mean(p) for p in prominence_per_word]
             elif self.prominence_mode == "max":
@@ -566,82 +636,107 @@ class ProsodyFeatureExtractor:
         for reader in tqdm(
             os.listdir(self.lab_root), desc="Extracting Features from Readers"
         ):
+            #print('reader', reader)
             if reader == ".DS_Store":
                 continue
 
             reader_path = os.path.join(self.lab_root, reader)
             reader_samples = []
-
-            for book in os.listdir(reader_path):
+            if (os.path.exists(reader_path) and os.path.isdir(reader_path)) == False:
+                print('error: reader_path is not a directory')
+            '''for book in os.listdir(reader_path):
+                print('book', book)
                 if book == ".DS_Store":
                     continue
                 book_path = os.path.join(reader_path, book)
-                book_files = [
-                    file for file in os.listdir(book_path) if file != ".DS_Store"
-                ]
+                print('book path', book_path)'''
+            book_files = [
+                file for file in os.listdir(reader_path) if file != ".DS_Store"
+            ]
+            #print("reader", reader)
+            #print("book", book)
+            for ut in book_files:
+                #print("utterance", ut)
+                if ut == ".DS_Store":
+                    continue
+                ut_path_lab = os.path.join(reader_path, ut)
+                #print("utterance lab path ", ut_path_lab)
+                ut_path_wav = os.path.join(
+                    self.wav_root, reader, ut.replace(".TextGrid", ".wav")
+                    #self.wav_root, reader, book, ut.replace(".lab", ".wav")
+                )
+                #print("utterance wav path ", ut_path_wav)
+                ut_path_txt = os.path.join(
+                    self.wav_root, reader, ut.replace(".TextGrid", ".txt")
+                    #self.wav_root, reader, book, ut.replace(".lab", ".original.txt")
+                )
+                if verbose:
+                    print(f"Processing file {ut_path_lab}")
+                #print("utterance txt path ", ut_path_txt)
+                text = str(open(ut_path_txt).read())
+                if verbose:
+                    print(f"Text: {text}")
 
-                for ut in book_files:
-                    # print("utterance", ut)
-                    if ut == ".DS_Store":
-                        continue
-                    ut_path_lab = os.path.join(book_path, ut)
-                    # print("utterance lab path ", ut_path_lab)
-                    ut_path_wav = os.path.join(
-                        self.wav_root, reader, book, ut.replace(".lab", ".wav")
-                    )
-                    # print("utterance wav path ", ut_path_wav)
-                    ut_path_txt = os.path.join(
-                        self.wav_root, reader, book, ut.replace(".lab", ".original.txt")
-                    )
-                    if verbose:
-                        print(f"Processing file {ut_path_lab}")
-
-                    text = str(open(ut_path_txt).read())
-                    if verbose:
-                        print(f"Text: {text}")
-
-                    # print(f"ut_lab_path: {ut_path_lab}")
-                    # print(
-                    #     f"replace {type(ut_path_lab.replace(self.lab_root, '').lstrip('/'))}"
-                    # )
-                    # create ut_path_phoneme_lab by removing self.lab_root from the front and adding self.phoneme_lab_root
-                    ut_path_phoneme_lab = os.path.join(
-                        str(self.phoneme_lab_root),
-                        str(ut_path_lab.replace(self.lab_root, "").lstrip("/")),
-                    )
-
+                #print(f"ut_lab_path: {ut_path_lab}")
+                # print(
+                #     f"replace {type(ut_path_lab.replace(self.lab_root, '').lstrip('/'))}"
+                # )
+                # create ut_path_phoneme_lab by removing self.lab_root from the front and adding self.phoneme_lab_root
+                ut_path_phoneme_lab = ut_path_lab
+                '''ut_path_phoneme_lab = os.path.join(
+                    str(self.phoneme_lab_root),
+                    str(ut_path_lab.replace(self.lab_root, "").lstrip("/")),
+                )'''
+                
+                try:
                     features, nb_syll_not_found = self._extract_features(
                         lab_path=ut_path_lab,
                         wav_path=ut_path_wav,
                         phoneme_lab_path=ut_path_phoneme_lab,
                     )
+                except Exception as e:
+                    print(f'error: features extraction: {e}')
+                    traceback.print_exc()
+                    failed_alignments += 1
+                    continue
+                '''features, nb_syll_not_found = self._extract_features(
+                    lab_path=ut_path_lab,
+                    wav_path=ut_path_wav,
+                    phoneme_lab_path=ut_path_phoneme_lab,
+                )'''
 
-                    if verbose:
-                        print(f"Features: {features}")
+                if verbose:
+                    print(f"Features: {features}")
 
-                    if features is None:
-                        failed_alignments += 1
-                        continue
-                    else:
-                        total_nb_syllables_not_found += nb_syll_not_found
+                if features is None:
+                    failed_alignments += 1
+                    continue
+                else:
+                    total_nb_syllables_not_found += nb_syll_not_found
 
-                    if verbose:
-                        print(f"Extracted numer of features: {len(features)}")
+                if verbose:
+                    print(f"Extracted numer of features: {len(features)}")
 
-                    sample = OrderedDict()
-                    sample["reader"] = reader
-                    sample["book"] = book
-                    sample["text"] = text
-                    sample["features"] = features
-                    sample["path_txt"] = ut_path_txt
-                    sample["path_lab"] = ut_path_lab
-                    sample["path_wav"] = ut_path_wav
-                    sample["filename"] = ut.replace(".lab", "")
-                    # print(sample)
-                    reader_samples.append(sample)
-            # add the sentence to the list of all sentences
+                sample = OrderedDict()
+                sample["reader"] = reader
+                sample["book"] = ut
+                sample["text"] = text
+                sample["features"] = features
+                sample["path_txt"] = ut_path_txt
+                sample["path_lab"] = ut_path_lab
+                sample["path_wav"] = ut_path_wav
+                sample["filename"] = ut.replace(".TextGrid", "")
+                # print(sample)
+                reader_samples.append(sample)
+            
             self.samples += reader_samples
-
+            # add the sentence to the list of all sentences
+            '''cache_path = os.path.join(self.data_cache, "f0.pkl")
+            self.cache_path = cache_path
+            os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
+            pickle.dump(reader_samples, open(self.cache_path, "wb"))
+            print(f"Saved samples to {self.cache_path}")'''
+        
         if verbose:
             print("Failed alignments: ", failed_alignments)
             print("Total number of syllables not found: ", total_nb_syllables_not_found)

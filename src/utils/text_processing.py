@@ -9,6 +9,8 @@ from nltk.corpus import cmudict
 import syllables
 import pyphen
 from g2p_en import G2p
+import tgt
+
 
 
 dic = pyphen.Pyphen(lang="en")
@@ -252,10 +254,10 @@ class CelexReader:
 
 def assign_labels(input_string, labels):
     # Create list to hold words and punctuation
-    words_with_punctuation = re.findall(r"[\w']+|[.,!?;\"-]|'", input_string)
+    words_with_punctuation = re.findall(r'[\u0E00-\u0E7F\w]+|[.,!?;"-]|\'', input_string) #words_with_punctuation = re.findall(r"[\w']+|[.,!?;\"-]|'", input_string)
 
     # Create list to hold only words
-    words_only = re.findall(r"\w+'?\w*", input_string)
+    words_only= re.findall(r'[\u0E00-\u0E7F\w]+', input_string) #words_only = re.findall(r"\w+'?\w*", input_string)
 
     # Make sure the number of labels matches the number of words
     if not len(labels) == len(words_only):
@@ -268,7 +270,7 @@ def assign_labels(input_string, labels):
     # Create list of tuples where each word is matched to a label and each punctuation is matched to None
     words_with_labels = []
     for token in words_with_punctuation:
-        if re.match(r"\w+'?\w*", token):
+        if re.match(r'[\u0E00-\u0E7F\w]+', token): #re.match(r"\w+'?\w*", token):
             words_with_labels.append(next(word_label_pairs))
         else:
             words_with_labels.append((token, None))
@@ -291,7 +293,7 @@ def assign_labels_to_sentences(sentences, labels):
         # remove Nones
         words_with_labels = [(w, l) for w, l in words_with_labels if l is not None]
         if len(words_with_labels) == 0:
-            # print("No labels for sentence {i}")
+            #print("No labels for sentence {i}")
             continue
         # process words and labels
         words, word_labels = zip(
@@ -299,7 +301,7 @@ def assign_labels_to_sentences(sentences, labels):
         )
         single_words.extend(words)
         single_labels.extend(word_labels)
-
+    
     return single_words, single_labels
 
 
@@ -505,6 +507,31 @@ def read_lab_file(lab_path):
     for line in lines:
         line[0], line[1] = float(line[0]), float(line[1])
     return lines
+
+def read_textgrid_file(filename, sample_rate=200, phones_or_words="words"):
+    try:
+        tg = tgt.read_textgrid(filename) #, include_empty_intervals=True)
+    except:
+        print("reading "+filename+" failed")
+
+        return
+    tiers = []
+    labs = {}
+
+    for tier in tg.get_tier_names():
+        if (tg.get_tier_by_name(tier)).tier_type()!='IntervalTier':
+            continue
+        tiers.append(tg.get_tier_by_name(tier))
+
+        lab = []
+        for a in tiers[-1].annotations:
+            try:
+                lab.append([a.start_time,a.end_time,a.text])
+            except:
+                pass
+        labs[tier.lower()] = lab
+    end_t = tg.end_time
+    return labs, end_t   
 
 
 def remove_breaks_from_lab_lines(lines):
